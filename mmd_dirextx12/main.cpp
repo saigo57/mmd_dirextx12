@@ -68,7 +68,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     ID3D12Device* _dev = nullptr;
     IDXGIFactory6* _dxgiFactory = nullptr;
-    // IDXGISwapchain4* _swapchain = nullptr;
 
     // アダプタを探す
     auto result = CreateDXGIFactory1(IID_PPV_ARGS(&_dxgiFactory));
@@ -113,6 +112,83 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 		return -1;
     }
 
+    ID3D12CommandAllocator* _cmdAllocator = nullptr;
+    if ( _dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_cmdAllocator)) != S_OK ) {
+        MessageBox(NULL, _T("Faild to init _cmdAllocator"), szWindowClass, NULL);
+        return -1;
+    }
+
+    ID3D12GraphicsCommandList* _cmdList = nullptr;
+    if (_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _cmdAllocator, nullptr, IID_PPV_ARGS(&_cmdList)) != S_OK) {
+        MessageBox(NULL, _T("Faild to init _cmdList"), szWindowClass, NULL);
+        return -1;
+    }
+
+    ID3D12CommandQueue* _cmdQueue = nullptr;
+    D3D12_COMMAND_QUEUE_DESC cmdQueueDesc = {};
+    cmdQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE; // タイムアウトなし
+    cmdQueueDesc.NodeMask = 0;
+    cmdQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    cmdQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; // コマンドリストと揃える
+    if (_dev->CreateCommandQueue(&cmdQueueDesc, IID_PPV_ARGS(&_cmdQueue)) != S_OK) {
+        MessageBox(NULL, _T("Faild to init _cmdQueue"), szWindowClass, NULL);
+        return -1;
+    }
+
+    IDXGISwapChain4* _swapchain = nullptr;
+    DXGI_SWAP_CHAIN_DESC1 swapchainDesc = {};
+    swapchainDesc.Width = WINDOW_WIDTH;
+    swapchainDesc.Height = WINDOW_HEIGHT;
+    swapchainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapchainDesc.Stereo = false;
+    swapchainDesc.SampleDesc.Count = 1;
+    swapchainDesc.SampleDesc.Quality = 0;
+    swapchainDesc.BufferUsage = DXGI_USAGE_BACK_BUFFER;
+    swapchainDesc.BufferCount = 2;
+    swapchainDesc.Scaling = DXGI_SCALING_STRETCH; // バックバッファーは伸び縮み可能
+    swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; // フリップ後破棄
+    swapchainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    swapchainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    if ( _dxgiFactory->CreateSwapChainForHwnd(_cmdQueue, hWnd, &swapchainDesc, nullptr, nullptr, (IDXGISwapChain1**)&_swapchain) != S_OK) {
+        MessageBox(NULL, _T("Faild to init _swapchain"), szWindowClass, NULL);
+        return -1;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heapDesc.NodeMask = 0;
+    heapDesc.NumDescriptors = 2;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    ID3D12DescriptorHeap* rtvHeaps = nullptr;
+    if ( _dev->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&rtvHeaps)) != S_OK ) {
+		MessageBox(NULL, _T("Faild to init rtvHeaps"), szWindowClass, NULL);
+		return -1;
+	}
+
+    // 一応上にswapchainDescがあるがリファクタあとのことなどを考えて再取得しておく
+    DXGI_SWAP_CHAIN_DESC swcDesc = {};
+    if ( _swapchain->GetDesc(&swcDesc) != S_OK) {
+		MessageBox(NULL, _T("Faild to get swcDesc"), szWindowClass, NULL);
+		return -1;
+	}
+    std::vector<ID3D12Resource*> _backBuffers(swcDesc.BufferCount);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = rtvHeaps->GetCPUDescriptorHandleForHeapStart();
+    for (size_t idx = 0; idx < swcDesc.BufferCount; ++idx) {
+        if (_swapchain->GetBuffer(idx, IID_PPV_ARGS(&_backBuffers[idx])) != S_OK) {
+            MessageBox(NULL, _T("Faild to get backBuffers"), szWindowClass, NULL);
+            return -1;
+        }
+
+        _dev->CreateRenderTargetView(_backBuffers[idx], nullptr, handle);
+        handle.ptr += _dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+    ID3D12Fence* _fence = nullptr;
+    UINT64 _fenceVal = 0;
+    if ( _dev->CreateFence(_fenceVal, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fence)) != S_OK ) {
+		MessageBox(NULL, _T("Faild to init _fence"), szWindowClass, NULL);
+		return -1;
+	}
+
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
 
@@ -121,6 +197,49 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+
+        if (msg.message == WM_QUIT) {
+            break;
+        }
+
+        auto bbIdx = _swapchain->GetCurrentBackBufferIndex();
+
+        D3D12_RESOURCE_BARRIER BarrierDesc = {};
+        BarrierDesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        BarrierDesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        BarrierDesc.Transition.pResource = _backBuffers[bbIdx];
+        BarrierDesc.Transition.Subresource = 0;
+        BarrierDesc.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        BarrierDesc.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        _cmdList->ResourceBarrier(1, &BarrierDesc);
+
+        auto rtvH = rtvHeaps->GetCPUDescriptorHandleForHeapStart();
+        rtvH.ptr += _dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) * bbIdx;
+        _cmdList->OMSetRenderTargets(1, &rtvH, true, nullptr);
+
+        float clearColor[] = { 1.0f, 1.0f, 0.0f, 1.0f };
+        _cmdList->ClearRenderTargetView(rtvH, clearColor, 0, nullptr);
+
+        BarrierDesc.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        BarrierDesc.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        _cmdList->ResourceBarrier(1, &BarrierDesc);
+
+        _cmdList->Close();
+        ID3D12CommandList* cmdLists[] = { _cmdList };
+        _cmdQueue->ExecuteCommandLists(1, cmdLists);
+        _cmdQueue->Signal(_fence, ++_fenceVal);
+
+        if (_fence->GetCompletedValue() != _fenceVal) {
+            auto event = CreateEvent(nullptr, false, false, nullptr);
+			_fence->SetEventOnCompletion(_fenceVal, event);
+			WaitForSingleObject(event, INFINITE);
+			CloseHandle(event);
+        }
+
+        _cmdAllocator->Reset(); // キューをクリア
+        _cmdList->Reset(_cmdAllocator, nullptr); // 次の準備
+
+        _swapchain->Present(1, 0);
     }
     return (int)msg.wParam;
 }
